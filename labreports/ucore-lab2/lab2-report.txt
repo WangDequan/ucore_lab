@@ -1,0 +1,60 @@
+﻿ucore lab2   
+
+一、实现综述与细节
+
+	设置vpt和vpd：
+	pte_t * const vpt = (pte_t *)VPT;
+		虚页表起始地址：0xFAC00000
+	pde_t * const vpd = (pde_t *)PGADDR(PDX(VPT), PDX(VPT), 0);
+		PGADDR(d, t, o)构造线性地址；
+		用VPT构造出一个地址，使得根据线性地址访问页表的第二步和第三步还可以一直访问一级页表本身。
+
+	练习1：查找页表项
+	pte_t *
+	get_pte(pde_t *pgdir, uintptr_t la, bool create)
+		先根据对应项地址“找”二级页表，如果没有对应的页表（根据控制位PTE_P），判断create是否为0，如果为0则返回NULL，否则申请新的物理页，设置相应属性（映射属性、PTE_USER）。如果已有二级页表，则无需上述处理。最后返回对应项地址。
+	
+	练习2：映射和取消映射
+	static inline void
+	page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
+		先判断是否有效（PTE_P），然后再执行取消映射操作：
+		看这个页还有没有映射到别的虚拟地址上（通过查看page_ref_dec(p)），如果没有，再解除映射。最后刷tlb。
+
+	练习3：打印页表
+	static int
+	get_pgtable_items(int left, int right, int start, uint32_t *table, int *left_store, int *right_store)
+		通过一个判断、循环控制结构来查找给定表项范围内具有连续相同权限的表项范围。
+		控制位判断：table[start] & PTE_P
+		权限：table[start] & PTE_USER
+
+	练习4：分配和释放物理页
+	static void
+	buddy_free_pages_sub(struct Page *base, size_t order)
+		计算buddy的index，检查权限，然后释放不用的存储块，清楚属性标记。最后将最终合并的buddy加入，设置属性。
+
+	练习5：处理Page Fault
+	static void
+	trap_dispatch(struct trapframe *tf)
+		调用pgfault_handler，处理page fault。如果处理失败，系统报错。
+
+	int
+	do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
+		根据所在VMA的权限设置访问权限。给未被映射的地址映射上物理页。同时操作的是mm所指定的页表，而不是内核的页表。如果处理失败，返回-E_NO_MEM，否则返回0。
+
+二、遇到的问题与解决方法
+	1. 系统出现panic：assert(nr_free_pages() == 8) failed
+	原因是我只做了前三个练习，而练习4也在proj5范围内……
+	不过由于系统出现故障时，会调用panic打印出错误，可以make debug后在gdb中调试发现问题，调试起来还是很容易发现问题的。
+
+	2. 打印页表不正常（不能输出结果）
+	在gdb中调试发现vpd设置错了，赋成了(pde_t *)PGADDR(PDX(VPT), PTX(VPT), PGOFF(VPT))，导致跑飞了。
+
+	3. 中断信息有问题
+	发现lab1完成的代码还需要merge进来，并且没有了T_SYSCALL，建立idt过程需要修改。
+
+	4. slab不能正常初始化（slab_init）
+	用Understand查看了函数调用关系图，发现pmm_init()根本就没调用slab_init()……这也是在看了lab3的代码框架后才发现的（对比了一下代码的不同）
+
+	5. 代码中如下函数
+	struct Page *pgdir_alloc_page(pde_t *pgdir, uintptr_t la, uint32_t perm);
+	只进行了声明，而没有定义。不过不用它也是可以的。

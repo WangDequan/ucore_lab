@@ -1,0 +1,295 @@
+ucore lab3 实验报告
+
+一、整体概述
+	1. 进程结构struct proc_struct
+	-----------code begin-----------
+		struct proc_struct {
+			enum proc_state state;	//进程状态（PROC_UNINIT, PROC_SLEEPING, PROC_RUNNABLE, PROC_ZOMBIE）
+			int pid;				//进程ID
+			int runs;				//已调度的次数
+			uintptr_t kstack;		//内核栈指针
+			volatile bool need_resched;		//是否需要被调度
+			struct proc_struct *parent;		//父进程指针
+			struct mm_struct *mm;			//内存管理信息
+			struct context context;			//进程切换的上下文（进行上下文切换的函数是switch_to）
+			struct trapframe *tf;			//中断帧的指针（当进程从用户空间跳到内核空间时,中断帧记录了进程在被中断前的状态。）
+			uintptr_t cr3;					//CR3寄存器
+			uint32_t flags;					//标记位
+			char name[PROC_NAME_LEN + 1];	//进程名称
+			list_entry_t list_link;			//双向链表
+			list_entry_t hash_link;			//hash链表
+			int exit_code;					//退出码（PF_EXITING用于退出），返回的值
+			uint32_t wait_state;			//等待状态标记位（包括WT_CHILD, WT_TIMER, WT_KSWAPD, WT_INTERRUPTED）
+			struct proc_struct *cptr, *yptr, *optr;	//子进程，同级前进程，同级后进程
+			list_entry_t thread_group;		//线程列表
+		};
+	-----------code end-----------
+
+	2. 进程管理
+																+ proc_run +
+	 -- alloc_proc --> PROC_UNINIT -- proc_init/wakeup_proc --> PROC_RUNNABLE -- try_free_pages/do_wait/do_sleep --> PROC_SLEEPING --
+											                     A      +                                                           +
+											                     |      +--- do_exit --> PROC_ZOMBIE                                +
+											                     +                                                                  + 
+												                 -----------------------wakeup_proc----------------------------------
+
+	3. 系统调用设计
+		每个系统调用都有一个编号，作为系统调用syscall的一个参数。
+		在用户空间将系统调用用函数封装，设置调用入口并封装实现，调用syscall。
+		经过一系列特权转换，执行到trap函数，它会调syscall（内核里）。
+		syscall函数根据系统调用号(也就是内核帧的eax项，用户进程进入内核态之前eax的值)来调用相应的系统调用函数。这跟中断向量表类似。
+		设计print系统调用时用到了cprintf函数，它把传入的字符串打印出来，返回字符串长度。
+
+二、实现细节
+	练习1	获取一个空闲的进程
+		alloc_proc函数负责建立一个新的进程（struct proc_struct结构），对结构中的所有参数进行初始化（置零、NULL或特殊值）。
+		具体如下（proj12版本，struct proc_struct结构各proj略有不同，具体见“一“中叙述）
+
+	------------------code begin----------------------	
+		static struct proc_struct *
+		alloc_proc(void) {
+			/* LAB3  */
+			struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
+			if (proc != NULL) {
+				//proj10～proj12				
+				proc->state = PROC_UNINIT;	//未初始化状态
+				proc->pid = -1;
+				proc->runs = 0;
+				proc->kstack = 0;
+				proc->need_resched = 0;
+				proc->parent = NULL;
+				proc->mm = NULL;
+				memset(&proc->context, 0, sizeof(struct context));	//清零
+				proc->tf = NULL;
+				proc->cr3 = boot_cr3;		//设置CR3为页目录表地址
+				proc->flags = 0;
+			 	set_proc_name(proc, "");	//清空
+				list_init(&proc->list_link);	//初始化链表
+				list_init(&proc->hash_link);	//初始化链表
+
+				//proj10.2～proj12
+				proc->exit_code = 0;
+				proc->wait_state = 0;
+				proc->cptr = NULL;
+				proc->yptr = NULL;
+				proc->optr = NULL;
+
+				//proj12
+				list_init(&proc->thread_group);
+			}
+			return proc;
+		}
+	------------------code end----------------------
+
+	练习2	为新创建的进程分配资源
+		do_fork创建当前进程的一个副本，它们的上下文、代码、数据都一样,但是存储位置不同。
+		在 fork 的过程中,需要给新进程分配资源,并且复制原进程的状态。处理过程：
+			- 调用 alloc_proc,首先获得一块用户信息块。
+			- 为进程分配一个内核栈。
+			- 复制原进程的内存管理信息到新进程
+			- 复制原进程上下文到新进程
+			- 将新进程添加到进程列表（各proj工作不尽相同，仅介绍proj12处理过程）
+			- 唤醒新进程
+			- 返回新进程号
+
+	------------------code begin----------------------	
+		int
+		do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf) {
+			int ret = -E_NO_FREE_PROC;
+			struct proc_struct *proc;
+			/* LAB3  */
+			//判断是否已存在进程数超过给定要求
+			if (nr_process > MAX_PROCESS)
+				goto fork_out;
+
+			//调用alloc_proc，获得一块用户信息块，如果获得失败，则返回
+			if ((proc = alloc_proc()) == NULL)
+				goto fork_out;
+			//设置新进程的父进程为当前进程
+			proc->parent = current;
+
+			//为进程分配一个内核栈，若失败则进入失败处理，然后返回
+			if (setup_kstack(proc) != 0)
+				goto bad_fork_cleanup_proc;
+			//复制内存管理信息，若失败则进入失败处理，然后返回
+			if (copy_mm(clone_flags, proc) != 0)
+				goto bad_fork_cleanup_kstack;
+			//复制原进程上下文到新进程（esp: stack）
+			copy_thread(proc, stack, tf);
+			
+			uint32_t flag;
+			//保存中断符
+			local_intr_save(flag);
+			//将新进程添加到进程列表（各proj工作不尽相同，下为proj12处理过程）
+			proc->pid = get_pid();		//设置进程ID，使用get_pid()
+			hash_proc(proc);			//用hash_proc函数设置进程hash链信息
+			set_links(proc);			//将进程加入进程链表中
+				//如果需要复制线程（？不太明白）， 把当前进程的thread_group加到proc中
+			if (clone_flags & CLONE_THREAD) {
+				list_add_before(&current->thread_group, &proc->thread_group);
+			}
+			//重载中断符
+			local_intr_restore(flag);
+			
+			//唤醒新进程
+			wakeup_proc(proc);
+			//返回进程ID
+			ret = proc->pid;
+	
+		fork_out:
+			return ret;
+
+		bad_fork_cleanup_kstack:
+			put_kstack(proc);
+		bad_fork_cleanup_proc:
+			kfree(proc);
+			goto fork_out;
+		}
+	------------------code end----------------------
+
+	练习3	编写 sleep 系统调用处理函数
+		do_sleep所做工作：
+			× 确定睡眠时间有效
+			× 初始化一个定时器,设好超时时间
+			× 关中断
+			× 把自己设为睡眠状态,并且正在等待延时
+			× 添加定时器到系统定时器列表
+			× 开中断
+			× 进入睡眠
+			× 从睡眠中苏醒,删除定时器
+
+	------------------code begin----------------------	
+		int
+		do_sleep(unsigned int time) {
+			/* LAB3  */
+			//确定睡眠时间为正整数
+			if (time <= 0)
+				return 0;
+			uint32_t flag;
+			
+			//保存中断符（interrupt flags），关中断
+			local_intr_save(flag);
+			//初始化一个定时器,设好超时时间
+			timer_t t;
+			timer_t *timer = timer_init(&t, current, time);
+			//把自己设为睡眠状态
+			current->state = PROC_SLEEPING;
+			//设置等待延时状态
+			current->wait_state = WT_TIMER;
+			//添加定时器到系统定时器列表
+			add_timer(timer);
+			//开中断
+			local_intr_restore(flag);
+			
+			//进入睡眠状态（使用schedule()）
+			schedule();
+			//从睡眠中苏醒,删除定时器
+			del_timer(timer);
+			return 0;
+		}
+	------------------code end----------------------
+
+	练习4	编写 kill 系统调用处理函数
+		do_kill：在目标进程的标志位中设置正在退出标记，并唤醒它。
+
+	------------------code begin--------------------
+		int
+		do_kill(int pid) {
+			/* LAB3  */
+			//找到目标进程
+			struct proc_struct *proc = find_proc(pid);
+			if (proc != NULL) {
+				//设置退出标记
+				proc->flags |= PF_EXITING;
+				//如果它的状态处于被中断状态,则唤醒它
+				if (proc->wait_state & WT_INTERRUPTED)
+					wakeup_proc(proc);
+				return 0;
+			}
+			return -E_INVAL;
+		}
+	------------------code end----------------------
+	
+	练习5～8	实现一个简单的系统调用
+		int print(char *str)，将 str 所指的字符串的内容由内核输出到屏幕上去,并得到字符串的长度。
+
+	------------------code begin--------------------
+	************* libs/unistd.h ***************
+	//为系统调用分配系统调用号	
+		/* SYS_print */
+		/* LAB3  */
+		#define SYS_print           29
+	
+	********** user/libs/syscall.h ************
+	//添加一个新的系统调用入口
+		/* LAB3  */
+		/* sys_print */
+		int sys_print(char *str);
+
+	********** user/libs/syscall.c ************
+	//完成调用关系
+		/* sys_print */
+		/* LAB3  */
+		int
+		sys_print(char *str) {
+			return syscall(SYS_print, str);
+		}
+
+	********** kern/syscall/syscall.c**********
+	//在系统调用函数表中添加一项，指向 sys_print 函数
+	//在sys_print函数中，取得所传参数，打印字符串，返回字符串的长度
+		/* sys_print */
+		/* LAB3  */
+		static uint32_t
+		sys_print(uint32_t arg[]) {
+			char *str = (char *)arg[0];
+			return cprintf(str);
+		}
+	
+		static uint32_t (*syscalls[])(uint32_t arg[]) = {
+			[SYS_exit]              sys_exit,
+			[SYS_fork]              sys_fork,
+			[SYS_wait]              sys_wait,
+			[SYS_exec]              sys_exec,
+			[SYS_clone]             sys_clone,
+			[SYS_yield]             sys_yield,
+			[SYS_kill]              sys_kill,
+			[SYS_sleep]             sys_sleep,
+			[SYS_gettime]           sys_gettime,
+			[SYS_getpid]            sys_getpid,
+			[SYS_brk]               sys_brk,
+			[SYS_mmap]              sys_mmap,
+			[SYS_munmap]            sys_munmap,
+			[SYS_shmem]             sys_shmem,
+			[SYS_putc]              sys_putc,
+			[SYS_pgdir]             sys_pgdir,
+			[SYS_print]				sys_print,
+		};
+	------------------code end--------------------
+	
+	问题: 为什么这时不释放内核栈?
+		子进程的信息还要被父进程使用，在子进程退出时不能释放它的内核栈。
+
+	测试：hello
+		执行 make run-hello 用户程序能正常运行：
+
+		kernel_execve: pid = 3, name = "hello".
+		Hello world!!.
+		I am process 3.
+		hello pass.
+		all user-mode processes have quit.
+		
+三、问题解决
+	missing "init check memory pass."
+		最后发现这个问题和timer_t定时器的初始化有关。开始我的方法是：
+
+		timer_t *timer = kmalloc(sizeof(timer_t));
+		timer = timer_init(timer, current, time);
+		...
+		kfree(timer);
+
+		和同学交流后改成下面的方法就没有问题了：
+		timer_t t;
+		timer_t *timer = timer_init(&t, current, time);
+
+		可能是静态分配和动态分配的问题吧。

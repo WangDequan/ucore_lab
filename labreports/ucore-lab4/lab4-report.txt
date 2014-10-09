@@ -1,0 +1,133 @@
+ucore lab4 实验报告
+
+一、整体概述
+
+	ucore 调度框架定义了如下接口（sched.h）:
+
+	------------------code begin--------------------
+		struct sched_class {
+    		// the name of sched_class
+			const char *name;
+			// Init the run queue
+			void (*init)(struct run_queue *rq);
+			// put the proc into runqueue, and this function must be called with rq_lock
+			void (*enqueue)(struct run_queue *rq, struct proc_struct *proc);
+			// get the proc out runqueue, and this function must be called with rq_lock
+			void (*dequeue)(struct run_queue *rq, struct proc_struct *proc);
+			// choose the next runnable task
+			struct proc_struct *(*pick_next)(struct run_queue *rq);
+			// dealer of the time-tick
+			void (*proc_tick)(struct run_queue *rq, struct proc_struct *proc);
+		};
+	------------------code end----------------------
+	
+	在sched.c中，sched_init函数设置调用的调度方法（例如，sched_class = &stride_sched_class;），使得每次进行进程调度都使用设定的方法。
+
+二、实现细节
+	
+	提问1: 如何证明该结论?	
+	（令 PASS_MAX 为当前所有进程里最大的步进值。则我们可以证明如下结论:对每次 Stride 调度器的调度步骤中,有其最大的步进值 STRIDE_MAX 和最小的步进值 STRIDE_MIN 之差: STRIDE_MAX - STRIDE_MIN <= PASS MAX）
+		
+		由条件，STRIDE_MAX <= PASS_MAX，且STRIDE_MIN >= 0，所以有STRIDE_MAX - STRIDE_MIN <= PASS MAX。
+
+	提问2: 在 ucore 中，目前 Stride 是采用无符号的 32 位整数表示。则 BigStride 应该取多少,才能保证比较的正确性?
+
+		要保证在比较两个 Stride 值时结果是正确的，即把两个值当作有符号的 32 位整数进行减法运算结果正确，则 STRIDE_MAX - STRIDE_MIN 最大不能超过 31 位所表示的最大正数，即 BIG STRIDE <= 2^31 - 1。
+
+	BIG_STRIDE在调度方法中取2^30 (1 << 30) 
+	
+	------------------code begin--------------------
+		#define BIG_STRIDE (1 << 30) 
+	------------------code end----------------------
+
+	调度初始化函数：
+
+	------------------code begin--------------------
+		static void
+		stride_init(struct run_queue *rq) {
+			 /* LAB4:  */
+			 list_init(&(rq->run_list));	// 初始化rq->run_list（双向链表）
+			 rq->lab4_run_pool = NULL;		// 初始化当前的 run-queue 初始化为一个空的堆（heap，优先队列）
+			 rq->proc_num = 0;				// 队列里进程数为0
+		}
+	------------------code end----------------------
+
+	进入调度队列run_queue：
+
+	------------------code begin--------------------
+		static void
+		stride_enqueue(struct run_queue *rq, struct proc_struct *proc) {
+			 /* LAB4:  */
+			proc->time_slice = rq->max_time_slice;	// 设置时间片分配
+			rq->lab4_run_pool = skew_heap_insert(rq->lab4_run_pool, &(proc->lab4_run_pool), proc_stride_comp_f);		// 将 proc 插入放入 run-queue 中去
+			proc->rq = rq;	// 设置proc中的rq指针
+			rq->proc_num ++;	// 队列里进程数加1
+		}
+
+	------------------code end----------------------
+
+	从调度队列run_queue移除：
+
+	------------------code begin--------------------
+		static void
+		stride_dequeue(struct run_queue *rq, struct proc_struct *proc) {
+			 /* LAB4:  */
+			 rq->lab4_run_pool = skew_heap_remove(rq->lab4_run_pool, &(proc->lab4_run_pool), proc_stride_comp_f);		// 将 proc 从 run-queue 中移除
+			 rq->proc_num--;	// 队列里进程数减1
+		}
+	------------------code end----------------------
+
+	从调度队列run_queue中选择一个到CPU中运行：
+
+	------------------code begin--------------------
+		static struct proc_struct *
+		stride_pick_next(struct run_queue *rq) {
+			 /* LAB4:  */
+			skew_heap_entry_t *le = rq->lab4_run_pool;	// 找到要运行的 proc 的优先队列中的一项（stride 值最小的对应进程，即堆顶）
+			 if (le != NULL) { // 存在 proc
+				struct proc_struct *proc = le2proc(le, lab4_run_pool);	// 转换成 proc_struct 类型
+				proc->lab4_stride += BIG_STRIDE / proc->lab4_priority;	// 更新对应进程的 stride 值
+				return proc;
+			 }	 	
+			 return NULL;	// 如果不存在就返回空指针
+		}
+	------------------code end----------------------
+
+	时间片计算：
+
+	------------------code begin--------------------
+		static void
+		stride_proc_tick(struct run_queue *rq, struct proc_struct *proc) {
+			 /* LAB4:  */
+			 if (proc->time_slice > 0) { // 检测当前进程是否已用完分配的时间片。
+				proc->time_slice --;
+			}
+			if (proc->time_slice == 0) { // 如果时间片用完，标记 need_resched 以引起进程切换
+				proc->need_resched = 1;
+			}
+		}
+	------------------code end----------------------
+
+三、问题解决
+
+	？1： 不能进行调度
+
+		解决：操作优先队列时，函数实现没有搞清楚，原来写成：
+
+			skew_heap_insert(rq->lab4_run_pool, &(proc->lab4_run_pool), proc_stride_comp_f);
+
+		查看实现后，返回值一定要赋值给rq->lab_run_pool，因为还做了以下操作：
+
+			return skew_heap_merge(a, b, comp);
+
+		改后就好了：
+
+			rq->lab4_run_pool = skew_heap_insert(rq->lab4_run_pool, &(proc->lab4_run_pool), proc_stride_comp_f);
+
+	？2： missing 'fork ok.'
+		
+		解决：返回值传错，写成了 return le2proc(le, lab4_run_pool)，改成如下：
+
+				struct proc_struct *proc = le2proc(le, lab4_run_pool);	// 转换成 proc_struct 类型
+				proc->lab4_stride += BIG_STRIDE / proc->lab4_priority;	// 更新对应进程的 stride 值
+				return proc;

@@ -1,0 +1,265 @@
+ucore lab5 实验报告
+
+一、实现细节
+	
+	1. 代码分析
+	
+	(1) 在 sem.c 文件中的 __down 函数中被 block 的进程是如何被唤醒的？被唤醒的方式可能有几种，他们在被唤醒的时刻是否还等待队列 Wait Queue 中？
+
+	分析：__down 函数中被 block 的进程有两种被唤醒的方式。一种是被 V 操作（__up 函数）唤醒，另一种是因为定时器超时（超过最长等待时间）而被唤醒。被 V 操作唤醒时，调用 wakeup_wait 函数，将进程从 Wait Queue 中删除，进程不在等待队列 Wait Queue 中；定时器超时后，进程被唤醒后还在等待队列 Wait Queue 中，此时需要在 __down 函数中额外将其删除。
+
+	(2) 分析在现有的 ucore 中， semphore 机制有几种可能的回收方式，他们分别涉及到哪些函数，又是何时被调用的。
+
+	分析：semaphore 通过 sem_queue_destroy 进行回收，有如下几种回收方式：
+	1) do_fork -> put_sem_queue -> sem_queue_destroy -> kfree
+		进程创建中，内存复制（copy_mm）失败，需要清理掉以分配的 semaphore	
+
+	2) do_exit -> put_sem_queue -> sem_queue_destroy -> kfree
+		进程退出，回收相应的 semaphore。
+
+	3) do_execve -> put_sem_queue -> sem_queue_destroy -> kfree
+		do_execve -> do_exit -> put_sem_queue -> sem_queue_destroy -> kfree
+		在复制的新进程中，回收原进程的semaphore（并创建新的semaphore）
+
+
+	2. 代码补全
+
+	(1) sem.c 中的 __up 和 __down 两个函数
+
+		__up: 实现信号量的 V 操作，首先检查信号量的有效性（sem->valid），然后关中断（local_intr_save），如果信号量对应的 Waitqueue 中没有进程在等待（sem->wait_queue为空），直接修改信号量的 value 值即可（sem->value ++），如果有进程在等待且进程等待的原因是 semaphore 设置的（w->proc->wait_state == wait_state），则将 waitqueue 中等待的第一个进程唤醒并将 waitqueue 中对应的项删除（wakeup_wait其中调用了wait_queue_del），最后恢复中断设置（local_intr_restore）。
+
+	--------------- code begin ------------------
+		static void __attribute__ ((noinline)) __up(semaphore_t *sem, uint32_t wait_state) {
+			assert(sem->valid);
+			bool intr_flag;
+			local_intr_save(intr_flag);
+			{
+				  // "LAB5: "
+				// 信号量对应的 Waitqueue 是否为空		
+				if (wait_queue_empty(&(sem->wait_queue))) {
+					sem->value ++;
+				}
+				else {
+					wait_t *w;
+					w = wait_queue_first(&(sem->wait_queue));
+					assert(w->proc->wait_state == wait_state);
+					// 如果有进程在等待且进程等待的原因是semaphore设置的
+					wakeup_wait(&(sem->wait_queue), w, wait_state, 1);
+				}
+			}
+			local_intr_restore(intr_flag);
+		}
+	--------------- code end ------------------
+
+		__down: 实现信号量的 P 操作，首先检查信号量的有效性，然后关掉中断，如果当前信号量的 value 大于0，那么直接做 value 的修改（sem->value--）并打开中断返回；否则需要将当前进程加入到等待队列中，新建一wait_t 类型指针，并用 wait_current_set 设置，然后运行调度器选择另外一个进程执行。在 __down 函数中还有一种可能是进程因为超时而被唤醒，而这种情况进程被唤醒后没被从 Wait Queue 删除，所以要删除。
+
+	--------------- code begin ------------------
+		static uint32_t __attribute__ ((noinline)) __down(semaphore_t *sem, uint32_t wait_state, timer_t *timer) {
+			assert(sem->valid);
+			bool intr_flag;
+			local_intr_save(intr_flag);
+			wait_t w;
+			wait_t *wait;
+			// "LAB5: "
+			if (sem->value > 0) {
+				sem->value--;
+				local_intr_restore(intr_flag);
+				return 0;
+			}
+			else {
+				wait = &w;
+				// 将当前进程加入到等待队列中
+				wait_current_set(&(sem->wait_queue), wait, wait_state);
+			}
+
+			ipc_add_timer(timer);
+			local_intr_restore(intr_flag);
+
+			schedule();
+
+			local_intr_save(intr_flag);
+			ipc_del_timer(timer);
+			wait_current_del(&(sem->wait_queue), wait);
+			local_intr_restore(intr_flag);
+
+			if (wait->wakeup_flags != wait_state) {
+				return wait->wakeup_flags;
+			}
+			return 0;
+		}
+	--------------- code end ------------------
+
+	(2) condition.h 中的 condition_wait 和 condition_signal 两个函数
+
+		condition_wait: 将 cdt_id 转化为 condition 变量（cdtid2cdt），条件变量的 numWaiting 值加1，然后将进程添加到等待队列中（wait_current_set），并释放目前获得的内核锁（sys_unlock），最后还要运行调度器选择下一个要执行的进程（schedule），这一过程是不允许中断的。
+
+	--------------- code begin ------------------
+		int 
+		condition_wait(cdt_t cdt_id, klock_t kl_id){
+
+			condition_t *cdt = cdtid2cdt(cdt_id);
+				bool intr_flag;
+			//"LAB5: "
+			local_intr_save(intr_flag);
+			cdt->numWaiting++;
+			wait_t w;
+			wait_t *wait = &w;
+			// 将进程添加到等待队列中
+			wait_current_set(&(cdt->wait_queue), wait, WT_KSEM);
+			// 释放目前获得的内核锁
+			sys_unlock(kl_id);
+			local_intr_restore(intr_flag);
+			// 运行调度器
+			schedule();
+			return 0;
+		}
+
+	--------------- code end ------------------
+
+		condition_signal: 首先将 cdt_id 转化为 condition 变量的内核态地址，如果目前有进程在条件变量的等待队列之上的话（cdt->numWaiting > 0），就从等待队列中取下一个进程，将这个进程唤醒（wakeup_first），并修改 numWaiting 的值（cdt->numWaiting--），这一过程不允许中断。
+
+	--------------- code begin ------------------
+		int 
+		condition_signal(cdt_t cdt_id){
+				condition_t *cdt = cdtid2cdt(cdt_id);
+			//"LAB5: "
+			bool intr_flag;
+			local_intr_save(intr_flag);
+			if (cdt->numWaiting > 0) {
+				wakeup_first(&(cdt->wait_queue), WT_INTERRUPTED, 1);
+				cdt->numWaiting--;
+			}
+			local_intr_restore(intr_flag);
+			return 0;
+		}
+	--------------- code end ------------------
+
+
+	(3) sem_wf.c 中写着优先读者和写者函数
+
+		按照课件中的方法实现：
+			信号量 sem_read 保证当有一个写进程准备访问数据区时，禁止所有的读进程，保证写者优先。信号量 sem_write 保证写进程的互斥。信号量 sem_x 保证 pCountR 被正确地更新，信号量 sem_y 保证 pCountW 被正确地更新。对于读进程，只允许一个读进程在 sem_read 上排队，所有其他读进程再等待 sem_read 之前，在信号量 sem_z 上排队。pCountW 控制 sem_write 的设置。
+
+	reader:
+	--------------- code begin ------------------
+		//Entering the critical region	
+		// "LAB5: "
+			sem_wait(sem_read);
+				sem_wait(sem_x);
+					(*pCountR)++;
+					if (*pCountR == 1)
+						sem_wait(sem_write);
+				sem_post(sem_x);
+			sem_post(sem_read);	
+		sem_post(sem_z);
+
+
+		//Leaving the critical region
+		// "LAB5: "
+		sem_wait(sem_x);
+			(*pCountR)--;
+			if ((*pCountR) == 0)
+				sem_post(sem_write);
+		sem_post(sem_x);
+	--------------- code end ------------------
+	
+	writer:
+	--------------- code begin ------------------
+		//Entering the critical region	
+		// "LAB5: "
+		sem_wait(sem_y);
+			(*pCountW)++;
+			if (*pCountW == 1)
+				sem_wait(sem_read);
+		sem_post(sem_y);
+		sem_wait(sem_write);
+
+	
+		//Leaving the critical region
+		// "LAB5: "
+		sem_post(sem_write);
+		sem_wait(sem_y);
+			(*pCountW)--;
+			if (*pCountW == 0)
+				sem_post(sem_read);
+		sem_post(sem_y);
+	--------------- code end ------------------
+
+	(4) cdt_wf.c 中写着优先读者和写者函数
+		
+	start_read: 当存在写者时（((*active_writer)+(*waiting_writer)) > 0），新进入的 reader 就必须等待，*waiting_reader增加1，体现写着优先。若没有写者时，读者可以读，*active_reader增加1，释放锁。
+	--------------- code begin ------------------
+		void
+		start_read(void) { // 开始读
+			klock_aquire(lock);
+			   while (((*active_writer)+(*waiting_writer)) > 0) { 
+			   	// "LAB5:  " 
+			   		(*waiting_reader)++;
+					cdt_wait(cdt_okToRead, lock);
+					(*waiting_reader)--;
+			  	}
+			 	(*active_reader) ++;
+			  	klock_release(lock);
+		}
+	--------------- code end ------------------
+
+	done_read: 完成读，*active_reader减少1，如果没有读者，且有要写的写者，标记 cdt_okToWrite
+	--------------- code begin ------------------
+		void
+		done_read(void) {
+			klock_aquire(lock);
+			// "LAB5:  "
+			(*active_reader)--;
+			if (*active_reader== 0 && *waiting_writer > 0) 
+				cdt_signal(cdt_okToWrite);
+			klock_release(lock);
+		}
+	--------------- code end ------------------
+
+	start_write: 如果有正在读的读者或正在写的写者(*active_reader + *active_writer > 0)，写者需等待，直至没有正在读读者和正在写写者。
+	--------------- code begin ------------------
+		void
+		start_write(void) {
+			klock_aquire(lock);
+			// "LAB5:  " replace the condition "1" with proper condition in next line
+			while (*active_reader + *active_writer > 0) {
+				(*waiting_writer) ++;
+				cdt_wait(cdt_okToWrite,lock);
+				(*waiting_writer) --;
+			   	}
+			 	(*active_writer) ++;
+			klock_release(lock);
+		}
+	--------------- code end ------------------
+
+	done_write: 体现写者优先，如果这个写者写完，如果有等待的读者（*waiting_reader > 0）或写者（*waiting_writer > 0），优先写者写，再让读者读。
+	--------------- code begin ------------------
+		void
+		done_write(void) {
+			klock_aquire(lock);
+			// "LAB5: "
+			(*active_writer)--;
+			if (*waiting_writer > 0)
+				cdt_signal(cdt_okToWrite);
+			else if (*waiting_reader > 0) {
+				int n = *waiting_reader;
+				while (n > 0) {
+					cdt_signal(cdt_okToRead);
+					n--;
+				}
+			}
+		
+			klock_release(lock);
+		}
+	--------------- code end ------------------
+
+
+二、问题解决
+	
+	?1 : 如何将当前进程加到等待队列？
+	开始不太清楚如何将进程与wait_t进行转换， 后来查看 wait.c 看到 wait_current_set 的实现就明白了。
+	
+	?2 : 如何通知所有读者？
+
+	进行 n 次 cdt_signal(cdt_okToRead)，n 取自 *waiting_reader。开始只进行了一次cdt_signal(cdt_okToRead)，导致有问题。
+	
