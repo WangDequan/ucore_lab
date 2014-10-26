@@ -156,7 +156,6 @@ default_free_pages(struct Page *base, size_t n) {
         p = le2page(le,page_link);
       }
     }
-
     nr_free += n;
     return ;
 }
