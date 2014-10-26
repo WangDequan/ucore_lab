@@ -58,96 +58,97 @@ free_area_t free_area;
 
 #define free_list (free_area.free_list)
 #define nr_free (free_area.nr_free)
-
+/* 初始化free_list同时为nr_free置零 */
 static void
 default_init(void) {
-    list_init(&free_list);
-    nr_free = 0;
+    list_init(&free_list); //free_list记录空的块
+    nr_free = 0; //nr_free为当前空块总数
 }
-
+/*函数用来初始化一块大小为PGSIZE*n的物理内存区域 
+调用过程依次为 kern_init --> pmm_init-->page_init-->init_memmap--> pmm_manager->init_memmap
+根据page_init函数传参，具体为某个连续地址的空闲块的起始页和页个数，建立空闲块的双向链表 */
 static void
 default_init_memmap(struct Page *base, size_t n) {
-    assert(n > 0);
-    struct Page *p = base;
+    assert(n > 0); //确认n的合理性
+    struct Page *p = base; //页指针
     for (; p != base + n; p ++) {
-        assert(PageReserved(p));
-        p->flags = 0;
-        SetPageProperty(p);
-        p->property = 0;
-        set_page_ref(p, 0);
-        list_add_before(&free_list, &(p->page_link));
+        assert(PageReserved(p)); //有效页
+        p->flags = 0; //有关有效性标记，参见pmm.c
+        SetPageProperty(p); //设置有效
+        p->property = 0;  //当前页为空且不为第一页则property为零
+        set_page_ref(p, 0); //由于p此时是free状态，ref也应置零
+        list_add_before(&free_list, &(p->page_link)); //链接free_list
     }
-    base->property = n;
-    SetPageProperty(base);
-    nr_free += n;
-    //first block
-    base->property = n;
+    base->property = n; //以base为首用property表示内存块page总数
+    nr_free += n; //更新物理内存空闲块总数
 }
-
+/* 函数用来实现first fit，输入所需的块大小n，返回相应第一个page的地址 */
 static struct Page *
 default_alloc_pages(size_t n) {
-    assert(n > 0);
-    if (n > nr_free) {
+    assert(n > 0); //检查n的合理性
+    if (n > nr_free) { //若n太大超过现存空闲块总数，则返回代表无法满足的空指针
         return NULL;
     }
     list_entry_t *le, *len;
     le = &free_list;
 
-    while((le=list_next(le)) != &free_list) {
-      struct Page *p = le2page(le, page_link);
-      if(p->property >= n){
+    while((le=list_next(le)) != &free_list) { //依次遍历free_list
+      struct Page *p = le2page(le, page_link); //得到对应页指针
+      if(p->property >= n){ //检查是否是足够大的块
         int i;
-        for(i=0;i<n;i++){
+        for(i=0;i<n;i++){ //设置已分配的内存空间
           len = list_next(le);
           struct Page *pp = le2page(le, page_link);
           SetPageReserved(pp);
-          ClearPageProperty(pp);
-          list_del(le);
+          ClearPageProperty(pp); 
+          /* 设置PG_reserve=1, PG_property=0 */
+          list_del(le); //删除已申请的页
           le = len;
         }
-        if(p->property>n){
+        if(p->property>n){ //若仍有剩余则将剩余块加回去
           (le2page(le,page_link))->property = p->property - n;
         }
         ClearPageProperty(p);
         SetPageReserved(p);
-        nr_free -= n;
-        return p;
+        nr_free -= n; //更新空块总数
+        return p; //返回目标指针
       }
     }
-    return NULL;
+    return NULL; //遍历后找不到符合条件的块则返回空指针
 }
-
+/* 函数参数是指向一个page物理地址的指针，以及需要free的pages的个数，主要功能是将以指针page开始的n块page的内存释放，并将其加入到free_list中 */
 static void
 default_free_pages(struct Page *base, size_t n) {
-    assert(n > 0);
-    assert(PageReserved(base));
+    assert(n > 0); //检查n的合理性
+    assert(PageReserved(base)); //检查base的合理性
 
-    list_entry_t *le = &free_list;
-    struct Page * p;
-    while((le=list_next(le)) != &free_list) {
-      p = le2page(le, page_link);
+    list_entry_t *le = &free_list; //得到free_list的表头
+    struct Page * p; //找到插入位置的页指针
+    while((le=list_next(le)) != &free_list) { //从高到低遍历找到合适的插入位置
+      p = le2page(le, page_link); //得到对应页的指针
       if(p>base){
         break;
       }
     }
-    //list_add_before(le, base->page_link);
+    //插入链表中并更新相关标记，如p->property等
     for(p=base;p<base+n;p++){
       list_add_before(le, &(p->page_link));
     }
-    base->flags = 0;
+    base->flags = 0; //重置p->ref, p->flags
     set_page_ref(base, 0);
     ClearPageProperty(base);
     SetPageProperty(base);
-    base->property = n;
+    /* 设置PG_reserve=1, PG_property=0 */
+    base->property = n; //设置页大小
     
     p = le2page(le,page_link) ;
     if( base+n == p ){
       base->property += p->property;
       p->property = 0;
     }
-    le = list_prev(&(base->page_link));
+    le = list_prev(&(base->page_link)); //合并块
     p = le2page(le, page_link);
-    if(le!=&free_list && p==base-1){
+    if(le!=&free_list && p==base-1){ //检查是否块之间是否可以合并
       while(le!=&free_list){
         if(p->property){
           p->property += base->property;
@@ -158,7 +159,8 @@ default_free_pages(struct Page *base, size_t n) {
         p = le2page(le,page_link);
       }
     }
-    nr_free += n;
+
+    nr_free += n; //增加空块总数
     return ;
 }
 

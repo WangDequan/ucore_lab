@@ -380,18 +380,24 @@ get_pte(pde_t *pgdir, uintptr_t la, bool create) {
     }
     return NULL;          // (8) return page table entry
 #endif
-    pde_t *pdep = &pgdir[PDX(la)];
-    if (!(*pdep & PTE_P)) {
+/*找到一个虚地址对应的二级页表项的内核虚地址，若不存在则分配一个包含此项的二级页表*/
+    pde_t *pdep = &pgdir[PDX(la)]; //寻找一级页表表项，获得相应指向页目录表项的指针
+    if (!(*pdep & PTE_P)) { //检查该页目录表项对应的page是否存在
         struct Page *page;
-        if (!create || (page = alloc_page()) == NULL) {
+        if (!create || (page = alloc_page()) == NULL) { //检查是否需要建立二级页表，若不存在则分配空间
             return NULL;
         }
-        set_page_ref(page, 1);
-        uintptr_t pa = page2pa(page);
-        memset(KADDR(pa), 0, PGSIZE);
-        *pdep = pa | PTE_U | PTE_W | PTE_P;
+        set_page_ref(page, 1); //设置page_ref
+        uintptr_t pa = page2pa(page); //获取线性地址，即物理地址
+        memset(KADDR(pa), 0, PGSIZE); //没有映射故需清空新申请的表，初始化该page所有位置
+        *pdep = pa | PTE_U | PTE_W | PTE_P; //设置控制页，将页表的物理地址处理后赋值给目录表项
     }
-    return &((pte_t *)KADDR(PDE_ADDR(*pdep)))[PTX(la)];
+    return &((pte_t *)KADDR(PDE_ADDR(*pdep)))[PTX(la)]; //返回二级页表项
+/* *pdep为pdep所指向的页目录表内容，存储了所指向的页表首地址及控制信息
+PDE_ADDR(*pdep)为所指向页表首物理地址，KADDR获得了页表首虚拟地址
+通过强制类型类型转换(pte_t *)强制转换成执行页表的首地址
+通过[PTX(la)]索引获得对应page中的Page table entry
+最后利用&操作符取其地址即为所求的pte */
 }
 
 //get_page - get related Page struct for linear address la using PDT pgdir
@@ -410,6 +416,7 @@ get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store) {
 //page_remove_pte - free an Page sturct which is related linear address la
 //                - and clean(invalidate) pte which is related linear address la
 //note: PT is changed, so the TLB need to be invalidate 
+/* 释放一个包含虚地址的物理内存页时，需要将管理此物理内存页的数据结构page做相应清除处理，使得物理内存页变为空闲状态，另外还需要将记录虚地址与物理地址对应的二级页表项清除 */
 static inline void
 page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep) {
     /* LAB2 EXERCISE 3: 12307130244
@@ -429,7 +436,7 @@ page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep) {
      *   PTE_P           0x001                   // page table/directory entry flags bit : Present
      */
 #if 0
-    if (0) {                      //(1) check if this page table entry is present
+    if (0) {                      //(1) check if page directory is present
         struct Page *page = NULL; //(2) find corresponding page to pte
                                   //(3) decrease page reference
                                   //(4) and free this page when page reference reachs 0
@@ -437,13 +444,13 @@ page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep) {
                                   //(6) flush tlb
     }
 #endif
-    if (*ptep & PTE_P) {
-        struct Page *page = pte2page(*ptep);
-        if (page_ref_dec(page) == 0) {
-            free_page(page);
+    if (*ptep & PTE_P) { //检测对应二级页表项是否存在
+        struct Page *page = pte2page(*ptep); //搜索相应一级页
+        if (page_ref_dec(page) == 0) { //page->ref-=1
+            free_page(page); //释放页
         }
-        *ptep = 0;
-        tlb_invalidate(pgdir, la);
+        *ptep = 0; //清除二级页表项指针，将ptep所指向内容清空
+        tlb_invalidate(pgdir, la); //删除tlb中的缓冲项
     }
 }
 
